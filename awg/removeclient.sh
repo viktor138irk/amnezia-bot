@@ -12,7 +12,8 @@ CLIENT_PUBLIC_KEY="$2"
 WG_CONFIG_FILE="$3"
 DOCKER_CONTAINER="$4"
 
-pwd=$(pwd)
+# Каталог скрипта, а не текущий каталог: бот может быть запущен откуда угодно.
+pwd="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$pwd/files"
 SERVER_CONF_PATH="$pwd/files/server.conf"
 
@@ -74,8 +75,8 @@ docker cp "$SERVER_CONF_PATH" "$DOCKER_CONTAINER":"$WG_CONFIG_FILE"
 
 docker exec -i "$DOCKER_CONTAINER" sh -c "wg-quick down '$WG_CONFIG_FILE' && wg-quick up '$WG_CONFIG_FILE'"
 
-rm -f "users/$CLIENT_NAME/$CLIENT_NAME.conf"
-rmdir "users/$CLIENT_NAME" 2>/dev/null || true
+rm -f "$pwd/users/$CLIENT_NAME/$CLIENT_NAME.conf"
+rmdir "$pwd/users/$CLIENT_NAME" 2>/dev/null || true
 
 CLIENTS_TABLE_PATH="$pwd/files/clientsTable"
 docker exec -i "$DOCKER_CONTAINER" cat /opt/amnezia/awg/clientsTable > "$CLIENTS_TABLE_PATH" || echo "[]" > "$CLIENTS_TABLE_PATH"

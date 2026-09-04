@@ -1,10 +1,31 @@
 #!/bin/bash
 
-# Конфигурация
-SERVICE_NAME="awg_bot"
-REPO_URL="https://github.com/stevefoxru/amnezia-bot.git"
-REPO_API="https://api.github.com/repos/stevefoxru/amnezia-bot"
-LOCAL_VERSION_FILE="/root/amnezia-bot/.version"
+# Конфигурация. Любое значение можно переопределить переменной окружения.
+SERVICE_NAME="${AWG_SERVICE_NAME:-awg_bot}"
+
+# Каталог установки бота (по умолчанию — как в прежних версиях).
+BASE_DIR="${AWG_BOT_HOME:-/root/amnezia-bot}"
+PARENT_DIR="$(dirname "$BASE_DIR")"
+BOT_DIRNAME="$(basename "$BASE_DIR")"
+
+# Репозиторий: берём origin уже установленной копии, иначе значение по умолчанию.
+DEFAULT_REPO_URL="https://github.com/viktor138irk/amnezia-bot.git"
+if [[ -z "$AWG_REPO_URL" && -d "$BASE_DIR/.git" ]]; then
+    AWG_REPO_URL="$(git -C "$BASE_DIR" remote get-url origin 2>/dev/null)"
+fi
+REPO_URL="${AWG_REPO_URL:-$DEFAULT_REPO_URL}"
+REPO_BRANCH="${AWG_REPO_BRANCH:-main}"
+# https://github.com/<owner>/<repo>.git -> https://api.github.com/repos/<owner>/<repo>
+REPO_API="https://api.github.com/repos/$(echo "$REPO_URL" | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+LOCAL_VERSION_FILE="$BASE_DIR/.version"
+
+# Python: нужен 3.10+, конкретная минорная версия не важна.
+PYTHON_BIN="${AWG_PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+    for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+        if command -v "$candidate" &>/dev/null; then PYTHON_BIN="$candidate"; break; fi
+    done
+fi
 
 # Цвета для вывода
 GREEN=$'\033[0;32m'
@@ -53,10 +74,10 @@ run_with_spinner() {
 # Функция проверки обновлений на GitHub
 check_github_updates() {
     local current_sha local_sha latest_sha auto_mode="$1"
-    cd /root/amnezia-bot || { echo -e "${RED}Каталог amnezia-bot не найден${NC}"; return 1; }
+    cd "$BASE_DIR" || { echo -e "${RED}Каталог $BASE_DIR не найден${NC}"; return 1; }
     
     echo -e "${YELLOW}Текущая директория: $(pwd)${NC}"
-    echo -e "${YELLOW}Содержимое /root/amnezia-bot:${NC}"
+    echo -e "${YELLOW}Содержимое $BASE_DIR:${NC}"
     ls -la
     
     # Получение текущего SHA коммита
@@ -64,7 +85,7 @@ check_github_updates() {
     
     # Получение последнего коммита через GitHub API
     if command -v curl &>/dev/null; then
-        latest_sha=$(curl -s "$REPO_API/commits/main" | jq -r '.sha' 2>/dev/null)
+        latest_sha=$(curl -s "$REPO_API/commits/$REPO_BRANCH" | jq -r '.sha' 2>/dev/null)
         [[ -z "$latest_sha" ]] && { echo -e "${RED}Не удалось получить данные с GitHub${NC}"; cd ..; return 1; }
     else
         echo -e "${RED}curl не установлен${NC}"; cd ..; return 1
@@ -83,14 +104,14 @@ check_github_updates() {
             echo -e "${YELLOW}Обнаружены локальные изменения. Сбрасываем их...${NC}"
             run_with_spinner "Сброс локальных изменений" "git reset --hard && git clean -fd"
         fi
-        run_with_spinner "Обновление репозитория" "git pull"
+        run_with_spinner "Обновление репозитория" "git pull origin $REPO_BRANCH"
         echo "$latest_sha" > "$LOCAL_VERSION_FILE"
         check_script_update
         # Проверка и создание виртуального окружения, если отсутствует
         if [[ ! -d "myenv" ]]; then
-            run_with_spinner "Создание виртуального окружения" "python3.11 -m venv myenv"
+            run_with_spinner "Создание виртуального окружения" "$PYTHON_BIN -m venv myenv"
         fi
-        run_with_spinner "Обновление Python-зависимостей" "source myenv/bin/activate && pip install --upgrade pip && pip install aiogram==2.25.1 aiohttp==3.8.6 apscheduler==3.10.4 humanize==4.9.0 pytz==2023.3.post1 && deactivate"
+        run_with_spinner "Обновление Python-зависимостей" "source myenv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt && deactivate"
         run_with_spinner "Перезапуск службы" "systemctl restart $SERVICE_NAME"
     else
         echo -ne "${BLUE}1) Установить 2) Отменить: ${NC}"; read choice
@@ -99,14 +120,14 @@ check_github_updates() {
                 echo -e "${YELLOW}Обнаружены локальные изменения. Сбрасываем их...${NC}"
                 run_with_spinner "Сброс локальных изменений" "git reset --hard && git clean -fd"
             fi
-            run_with_spinner "Обновление репозитория" "git pull"
+            run_with_spinner "Обновление репозитория" "git pull origin $REPO_BRANCH"
             echo "$latest_sha" > "$LOCAL_VERSION_FILE"
             check_script_update
             # Проверка и создание виртуального окружения, если отсутствует
             if [[ ! -d "myenv" ]]; then
-                run_with_spinner "Создание виртуального окружения" "python3.11 -m venv myenv"
+                run_with_spinner "Создание виртуального окружения" "$PYTHON_BIN -m venv myenv"
             fi
-            run_with_spinner "Обновление Python-зависимостей" "source myenv/bin/activate && pip install --upgrade pip && pip install aiogram==2.25.1 aiohttp==3.8.6 apscheduler==3.10.4 humanize==4.9.0 pytz==2023.3.post1 && deactivate"
+            run_with_spinner "Обновление Python-зависимостей" "source myenv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt && deactivate"
             run_with_spinner "Перезапуск службы" "systemctl restart $SERVICE_NAME"
         else
             echo -e "${YELLOW}Обновление отменено${NC}"
@@ -118,8 +139,8 @@ check_github_updates() {
 # Проверка обновления самого скрипта
 check_script_update() {
     local temp_script=$(mktemp)
-    if [[ -f "/root/amnezia-bot/install.sh" ]]; then
-        cp "/root/amnezia-bot/install.sh" "$temp_script"
+    if [[ -f "$BASE_DIR/install.sh" ]]; then
+        cp "$BASE_DIR/install.sh" "$temp_script"
         if ! cmp -s "$SCRIPT_PATH" "$temp_script"; then
             echo -e "${YELLOW}Обнаружено обновление скрипта install.sh${NC}"
             run_with_spinner "Обновление скрипта" "mv $temp_script $SCRIPT_PATH && chmod +x $SCRIPT_PATH"
@@ -130,8 +151,8 @@ check_script_update() {
         fi
     else
         echo -e "${YELLOW}Скрипт install.sh не найден в репозитории, копируем локальную версию${NC}"
-        cp "$SCRIPT_PATH" "/root/amnezia-bot/install.sh"
-        chmod +x "/root/amnezia-bot/install.sh"
+        cp "$SCRIPT_PATH" "$BASE_DIR/install.sh"
+        chmod +x "$BASE_DIR/install.sh"
     fi
 }
 
@@ -147,7 +168,11 @@ check_updates() {
     fi
 
     # Проверка остальных зависимостей
-    for cmd in git curl python3.11; do
+    if [[ -z "$PYTHON_BIN" ]]; then
+        echo -e "${RED}Python 3 не найден. Установите python3 (3.10 или новее).${NC}"
+        exit 1
+    fi
+    for cmd in git curl "$PYTHON_BIN"; do
         if ! command -v "$cmd" &>/dev/null; then
             echo -e "${RED}$cmd не установлен. Установите $cmd для продолжения.${NC}"
             exit 1
@@ -161,22 +186,23 @@ check_updates() {
     fi
 
     # Проверка и клонирование репозитория, если он отсутствует
-    if [[ ! -d "/root/amnezia-bot/.git" ]]; then
-        echo -e "${YELLOW}Репозиторий не найден. Проверяем /root/amnezia-bot...${NC}"
-        echo -e "${YELLOW}Содержимое /root:${NC}"
-        ls -la /root
-        if [[ -d "/root/amnezia-bot" ]]; then
-            echo -e "${YELLOW}Директория /root/amnezia-bot существует, но не является git-репозиторием. Удаляем её...${NC}"
-            rm -rf /root/amnezia-bot || error_exit "Не удалось удалить поврежденную директорию /root/amnezia-bot"
+    if [[ ! -d "$BASE_DIR/.git" ]]; then
+        echo -e "${YELLOW}Репозиторий не найден. Проверяем $BASE_DIR...${NC}"
+        echo -e "${YELLOW}Содержимое $PARENT_DIR:${NC}"
+        ls -la "$PARENT_DIR"
+        if [[ -d "$BASE_DIR" ]]; then
+            echo -e "${YELLOW}Директория $BASE_DIR существует, но не является git-репозиторием. Удаляем её...${NC}"
+            rm -rf $BASE_DIR || error_exit "Не удалось удалить поврежденную директорию $BASE_DIR"
         fi
         echo -e "${YELLOW}Клонируем репозиторий...${NC}"
-        cd /root || error_exit "Не удалось перейти в /root"
-        run_with_spinner "Клонирование репозитория" "git clone $REPO_URL"
-        cd amnezia-bot || error_exit "Не удалось перейти в каталог amnezia-bot"
+        mkdir -p "$PARENT_DIR" || error_exit "Не удалось создать $PARENT_DIR"
+        cd "$PARENT_DIR" || error_exit "Не удалось перейти в $PARENT_DIR"
+        run_with_spinner "Клонирование репозитория" "git clone -b $REPO_BRANCH $REPO_URL $BOT_DIRNAME"
+        cd "$BOT_DIRNAME" || error_exit "Не удалось перейти в каталог $BOT_DIRNAME"
         if [[ ! -d ".git" ]]; then
             error_exit "Клонирование репозитория не удалось. Проверьте доступ к $REPO_URL"
         fi
-        echo -e "${YELLOW}Содержимое /root/amnezia-bot после клонирования:${NC}"
+        echo -e "${YELLOW}Содержимое $BASE_DIR после клонирования:${NC}"
         ls -la
     fi
     check_github_updates "$1"

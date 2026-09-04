@@ -61,8 +61,7 @@ def process_conf_data(data):
                 print(f"Resolved DNS '{address}' to IP '{resolved_ip}'", file=sys.stderr)
                 return f"{prefix}{resolved_ip}:{port}{suffix}"
             else:
-                print(f"Error: Could not resolve DNS name '{address}'", file=sys.stderr)
-                sys.exit(1)
+                raise ValueError(f"Не удалось разрешить DNS-имя '{address}'")
         else:
             return full_line
     pattern = r'^(.*Endpoint\s*=\s*)([^\s:]+)(?::(\d+))(.*)$'
@@ -107,7 +106,11 @@ def main():
             print(f'Error reading file {args.input}: {e}')
             sys.exit(1)
 
-        processed_data = process_conf_data(data)
+        try:
+            processed_data = process_conf_data(data)
+        except ValueError as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
 
         encoded_string = encode(processed_data)
 

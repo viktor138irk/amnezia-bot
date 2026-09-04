@@ -1,1074 +1,993 @@
-import db
-import aiohttp
-import logging
+"""Telegram-бот управления AmneziaVPN (aiogram 3)."""
 import asyncio
-import aiofiles
+import html
+import logging
 import os
-import re
-import json
 import sys
-import uuid
-from aiogram import Bot, types
-from aiogram.dispatcher import Dispatcher
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import zipfile
 from datetime import datetime, timedelta
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import pytz
-import shutil
 
-logging.basicConfig(level=logging.INFO)
+import pytz
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery, FSInputFile, Message, PreCheckoutQuery,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import config
+import db
+import keyboards as kb
+import payments
+import settings as settings_module
+import vpn
+
+logging.basicConfig(
+    level=os.environ.get('AWG_LOG_LEVEL', 'INFO'),
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+)
 logger = logging.getLogger(__name__)
 
-# Загрузка конфигурации
-setting = db.get_config()
-bot_token = setting.get('bot_token')
-admin_ids = setting.get('admin_ids', [])
-moderator_ids = setting.get('moderator_ids', [])
-wg_config_file = setting.get('wg_config_file')
-docker_container = setting.get('docker_container')
-endpoint = setting.get('endpoint')
-pricing = setting.get('pricing', {
-    '1_month': 1000.0,
-    '3_months': 2500.0,
-    '6_months': 4500.0,
-    '12_months': 8000.0
-})
+config.ensure_dirs()
 
-if not all([bot_token, admin_ids, wg_config_file, docker_container, endpoint]):
-    logger.error("Некоторые обязательные настройки отсутствуют.")
+try:
+    SETTINGS = settings_module.load()
+except ValueError as e:
+    logger.error(str(e))
     sys.exit(1)
 
-admins = [int(admin_id) for admin_id in admin_ids]
-moderators = [int(mod_id) for mod_id in moderator_ids]
-bot = Bot(bot_token)
-WG_CONFIG_FILE = wg_config_file
-DOCKER_CONTAINER = docker_container
-ENDPOINT = endpoint
-PRICING = pricing
+bot = Bot(SETTINGS.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
-class AdminMessageDeletionMiddleware(BaseMiddleware):
-    async def on_process_message(self, message: types.Message, data: dict):
-        if message.from_user.id in admins and message.text.startswith('/'):
-            asyncio.create_task(delete_message_after_delay(message.chat.id, message.message_id))
-
-dp = Dispatcher(bot)
+# payment_router подключается первым: апдейт successful_payment приходит без
+# текста и иначе его перехватил бы обработчик, ждущим ввода в FSM.
+payment_router = Router()
+router = Router()
+dp.include_router(payment_router)
+dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=pytz.utc)
-scheduler.start()
-dp.middleware.setup(AdminMessageDeletionMiddleware())
 
-# Главное меню
-def get_main_menu_markup(user_id):
-    markup = InlineKeyboardMarkup(row_width=2)
-    if user_id in admins:
-        markup.add(
-            InlineKeyboardButton("➕ Добавить пользователя", callback_data="add_user"),
-            InlineKeyboardButton("📋 Список клиентов", callback_data="list_users")
-        )
-        markup.add(
-            InlineKeyboardButton("🔑 Получить конфиг", callback_data="get_config"),
-            InlineKeyboardButton("🎟️ Управление промокодами", callback_data="manage_promocodes")
-        )
-        markup.add(
-            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-            InlineKeyboardButton("🏠 Домой", callback_data="home")
-        )
-    elif user_id in moderators:
-        markup.add(
-            InlineKeyboardButton("➕ Добавить пользователя", callback_data="add_user"),
-            InlineKeyboardButton("📋 Список клиентов", callback_data="list_users")
-        )
-        markup.add(
-            InlineKeyboardButton("🔑 Получить конфиг", callback_data="get_config"),
-            InlineKeyboardButton("🏠 Домой", callback_data="home")
-        )
-    else:
-        markup.add(
-            InlineKeyboardButton("🎟️ Получить ключ по промокоду", callback_data="use_promocode"),
-            InlineKeyboardButton("🏠 Домой", callback_data="home")
-        )
-    return markup
+ONLINE_THRESHOLD_SECONDS = 180
 
-# Меню покупки ключа
-def get_buy_key_menu(user_id):
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton("🎟️ Ввести промокод", callback_data="use_promocode"))
-    markup.add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-    return markup
 
-# Меню настроек
-def get_settings_menu():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("💾 Создать бэкап", callback_data="create_backup"),
-        InlineKeyboardButton("👥 Список админов", callback_data="list_admins")
-    )
-    markup.add(
-        InlineKeyboardButton("👤 Добавить админа", callback_data="add_admin"),
-        InlineKeyboardButton("💰 Настройки цен", callback_data="pricing_settings")
-    )
-    markup.add(InlineKeyboardButton("⬅️ Назад", callback_data="home"))
-    return markup
+class AdminCommandCleanupMiddleware(BaseMiddleware):
+    """Удаляет команды администраторов из чата, чтобы не засорять переписку."""
 
-# Меню настроек цен
-def get_pricing_settings_menu():
-    markup = InlineKeyboardMarkup(row_width=2)
-    periods = [
-        ("1 месяц", "1_month"),
-        ("3 месяца", "3_months"),
-        ("6 месяцев", "6_months"),
-        ("12 месяцев", "12_months")
-    ]
-    for period_name, period_key in periods:
-        markup.add(InlineKeyboardButton(
-            f"{period_name} - ₽{PRICING.get(period_key, 0):.2f}",
-            callback_data=f"set_price_{period_key}"
-        ))
-    markup.add(InlineKeyboardButton("⬅️ Назад", callback_data="settings"))
-    return markup
+    async def __call__(self, handler, event: Message, data):
+        user = event.from_user
+        if user and event.text and event.text.startswith('/') and SETTINGS.is_admin(user.id):
+            asyncio.create_task(delete_message_later(event.chat.id, event.message_id))
+        return await handler(event, data)
 
-# Клавиатура для выбора периода продления
-def get_renewal_period_keyboard(username):
-    markup = InlineKeyboardMarkup(row_width=2)
-    periods = [
-        ("1 месяц", "1_month"),
-        ("3 месяца", "3_months"),
-        ("6 месяцев", "6_months"),
-        ("12 месяцев", "12_months"),
-        ("Кастомная дата", "custom_date")
-    ]
-    for period_name, period_key in periods:
-        markup.add(InlineKeyboardButton(period_name, callback_data=f"renew_period_{username}_{period_key}"))
-    markup.add(InlineKeyboardButton("Отмена", callback_data="home"))
-    return markup
 
-user_main_messages = {}
-
-async def delete_message_after_delay(chat_id: int, message_id: int, delay: int = 2):
+async def delete_message_later(chat_id, message_id, delay=2):
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id, message_id)
-    except:
+    except Exception:
         pass
 
-async def generate_vpn_key(conf_path: str) -> str:
-    process = await asyncio.create_subprocess_exec(
-        'python3.11', '/root/amnezia-bot/awg/awg-decode.py', '--encode', conf_path,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+
+dp.message.middleware(AdminCommandCleanupMiddleware())
+
+
+class Form(StatesGroup):
+    """Состояния диалогов, заменяют самодельный словарь состояний."""
+    user_name = State()
+    admin_id = State()
+    promocode = State()
+    new_promocode = State()
+    price = State()
+    custom_date = State()
+
+
+# --- Вспомогательные функции ------------------------------------------------
+
+def esc(value):
+    """Экранирует текст для HTML-разметки."""
+    return html.escape(str(value))
+
+
+def chat_id_of(callback):
+    """Чат, в котором показан экран. Для недоступного сообщения — личный чат."""
+    message = callback.message
+    return message.chat.id if message is not None else callback.from_user.id
+
+
+async def show(event, text, markup=None):
+    """Показывает экран: редактирует текущее сообщение или отправляет новое."""
+    if not isinstance(event, CallbackQuery):
+        return await event.answer(text, reply_markup=markup)
+
+    message = event.message
+    if message is not None:
+        try:
+            return await message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as e:
+            if 'message is not modified' in str(e):
+                return message
+            # Сообщение не редактируется (документ, слишком старое) — шлём новое.
+        except AttributeError:
+            # InaccessibleMessage: содержимого нет, редактировать нечего.
+            pass
+    return await bot.send_message(chat_id_of(event), text, reply_markup=markup)
+
+
+async def show_main_menu(event, state=None, text='Выберите действие:'):
+    if state is not None:
+        await state.clear()
+    user_id = event.from_user.id
+    return await show(event, text, kb.main_menu(user_id, SETTINGS))
+
+
+async def deny(callback, text='Нет прав.'):
+    await callback.answer(text, show_alert=True)
+
+
+async def send_client_config(chat_id, username, header=None):
+    """Отправляет пользователю .conf и ссылку vpn:// для AmneziaVPN."""
+    conf_path = vpn.client_conf_path(username)
+    if not conf_path.exists():
+        await bot.send_message(chat_id, f'Конфигурация для <b>{esc(username)}</b> не найдена.')
+        return False
+
+    caption = header or f'Конфигурация для <b>{esc(username)}</b>'
+    document = await bot.send_document(
+        chat_id, FSInputFile(conf_path, filename=f'{username}.conf'), caption=caption,
     )
-    stdout, stderr = await process.communicate()
-    if process.returncode == 0 and stdout.decode().startswith('vpn://'):
-        return stdout.decode().strip()
+    try:
+        await bot.pin_chat_message(chat_id, document.message_id, disable_notification=True)
+    except TelegramBadRequest:
+        pass
+
+    vpn_key = await vpn.generate_vpn_key(conf_path)
+    if vpn_key:
+        # Ключ уходит отдельным сообщением: он длинный и не всегда влезает в подпись.
+        await bot.send_message(
+            chat_id,
+            'Ключ для приложения AmneziaVPN '
+            '(<a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Google Play</a>, '
+            '<a href="https://github.com/amnezia-vpn/amnezia-client">GitHub</a>):\n'
+            f'<pre>{esc(vpn_key)}</pre>',
+            disable_web_page_preview=True,
+        )
     else:
-        logger.error(f"Ошибка генерации vpn://: {stderr.decode()}")
-        return ""
+        await bot.send_message(
+            chat_id,
+            'Не удалось сформировать ссылку vpn:// — используйте приложенный файл .conf.',
+        )
+    return True
 
-async def issue_vpn_key(user_id: int, period: str) -> bool:
-    username = f"user_{user_id}_{uuid.uuid4().hex[:8]}"
-    success = db.root_add(username, ipv6=False)
-    if success:
-        months = {'1_month': 1, '3_months': 3, '6_months': 6, '12_months': 12}.get(period, 1)
-        expiration = datetime.now(pytz.utc) + timedelta(days=30 * months)
-        db.set_user_expiration(username, expiration, "Неограниченно")
-        db.set_user_telegram_id(username, user_id)
-        conf_path = os.path.join('users', username, f'{username}.conf')
-        if os.path.exists(conf_path):
-            vpn_key = await generate_vpn_key(conf_path)
-            caption = f"Ваш VPN ключ ({period.replace('_', ' ')}):\nAmneziaVPN:\n[Google Play](https://play.google.com/store/apps/details?id=org.amnezia.vpn&hl=ru)\n[GitHub](https://github.com/amnezia-vpn/amnezia-client)\n```\n{vpn_key}\n```"
-            with open(conf_path, 'rb') as config:
-                config_message = await bot.send_document(user_id, config, caption=caption, parse_mode="Markdown")
-                await bot.pin_chat_message(user_id, config_message.message_id, disable_notification=True)
-            return True
-    return False
 
-@dp.message_handler(commands=['start', 'help'])
-async def start_command_handler(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in user_main_messages:
+async def notify_admins(text):
+    """Сообщает всем администраторам о ситуации, требующей вмешательства."""
+    for admin_id in SETTINGS.admin_ids:
         try:
-            await bot.delete_message(
-                chat_id=user_main_messages[user_id]['chat_id'],
-                message_id=user_main_messages[user_id]['message_id']
-            )
-        except:
-            pass
-    sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
 
-@dp.message_handler(commands=['add_admin'])
-async def add_admin_command(message: types.Message):
-    if message.from_user.id not in admins:
-        await message.answer("У вас нет прав.")
+
+def format_expiration(expiration):
+    return expiration.strftime('%d.%m.%Y %H:%M UTC') if expiration else 'не установлен'
+
+
+# --- Команды ----------------------------------------------------------------
+
+@router.message(Command('start', 'help'))
+async def start_command(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer('Выберите действие:', reply_markup=kb.main_menu(message.from_user.id, SETTINGS))
+
+
+@router.message(Command('add_admin'))
+async def add_admin_command(message: Message):
+    if not SETTINGS.is_admin(message.from_user.id):
+        await message.answer('У вас нет прав.')
         return
-    try:
-        new_admin_id = int(message.text.split()[1])
-        if new_admin_id not in admins:
-            db.add_admin(new_admin_id)
-            admins.append(new_admin_id)
-            await message.answer(f"Админ {new_admin_id} добавлен.")
-            await bot.send_message(new_admin_id, "Вы назначены администратором!")
-    except:
-        await message.answer("Формат: /add_admin <user_id>")
-
-@dp.message_handler()
-async def handle_messages(message: types.Message):
-    global PRICING
-    user_id = message.from_user.id
-    user_state = user_main_messages.get(user_id, {}).get('state')
-
-    if user_state == 'waiting_for_user_name':
-        user_name = message.text.strip()
-        if not re.match(r'^[a-zA-Z0-9_-]+$', user_name):
-            await message.reply("Имя может содержать только буквы, цифры, - и _.")
-            return
-        success = db.root_add(user_name, ipv6=False)
-        if success:
-            conf_path = os.path.join('users', user_name, f'{user_name}.conf')
-            if os.path.exists(conf_path):
-                vpn_key = await generate_vpn_key(conf_path)
-                caption = f"Конфигурация для {user_name}:\nAmneziaVPN:\n[Google Play](https://play.google.com/store/apps/details?id=org.amnezia.vpn&hl=ru)\n[GitHub](https://github.com/amnezia-vpn/amnezia-client)\n```\n{vpn_key}\n```"
-                with open(conf_path, 'rb') as config:
-                    config_message = await bot.send_document(user_id, config, caption=caption, parse_mode="Markdown")
-                    await bot.pin_chat_message(user_id, config_message.message_id, disable_notification=True)
-        sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-    elif user_state == 'waiting_for_admin_id' and user_id in admins:
-        try:
-            new_admin_id = int(message.text.strip())
-            if new_admin_id not in admins:
-                db.add_admin(new_admin_id)
-                admins.append(new_admin_id)
-                await message.reply(f"Админ {new_admin_id} добавлен.")
-                await bot.send_message(new_admin_id, "Вы назначены администратором!")
-            sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-            user_main_messages[user_id] = {
-                'chat_id': sent_message.chat.id,
-                'message_id': sent_message.message_id,
-                'state': None
-            }
-        except:
-            await message.reply("Введите корректный Telegram ID.")
-    elif user_state == 'waiting_for_promocode':
-        promocode = message.text.strip()
-        promocode_data = db.apply_promocode(promocode)
-        if promocode_data:
-            subscription_period = promocode_data.get('subscription_period')
-            if subscription_period:
-                success = await issue_vpn_key(user_id, subscription_period)
-                if success:
-                    await message.reply(f"Промокод активирован! VPN ключ на {subscription_period.replace('_', ' ')} выдан.")
-                else:
-                    await message.reply("Ошибка при выдаче ключа. Обратитесь к администратору.")
-            else:
-                await message.reply("Промокод не предоставляет ключ.")
-        else:
-            await message.reply("Неверный или истёкший промокод.")
-        sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-    elif user_state == 'waiting_for_new_promocode' and user_id in admins:
-        try:
-            parts = message.text.strip().split()
-            if len(parts) != 5:
-                raise ValueError("Неверный формат")
-            code, discount, days_valid, max_uses, subscription_period = parts
-            discount = float(discount)
-            days_valid = int(days_valid)
-            max_uses = int(max_uses) if max_uses.lower() != 'none' else None
-            if subscription_period not in ['none', '1_month', '3_months', '6_months', '12_months']:
-                raise ValueError("Неверный период подписки")
-            subscription_period = None if subscription_period.lower() == 'none' else subscription_period
-            expires_at = datetime.now(pytz.utc) + timedelta(days=days_valid) if days_valid > 0 else None
-            if db.add_promocode(code, discount, expires_at, max_uses, subscription_period):
-                await message.reply(
-                    f"Промокод {code} добавлен: скидка {discount}%, действует {days_valid} дней, "
-                    f"макс. использований: {max_uses or 'неограничено'}, период подписки: {subscription_period or 'нет'}"
-                )
-            else:
-                await message.reply("Промокод уже существует.")
-        except:
-            await message.reply(
-                "Формат: <код> <скидка%> <дней_действия> <макс_использований|none> <период_подписки|none>\n"
-                "Пример: PROMO1 10 30 none 1_month"
-            )
-        sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-    elif user_state.startswith('waiting_for_price_') and user_id in admins:
-        period = user_state.split('waiting_for_price_')[1]
-        try:
-            price = float(message.text.strip())
-            if price <= 0:
-                raise ValueError("Цена должна быть положительной.")
-            db.set_pricing(period, price)
-            PRICING[period] = price
-            await message.reply(f"Цена для {period.replace('_', ' ')} обновлена: ₽{price:.2f}")
-        except:
-            await message.reply("Введите корректное число (например, 1000.00).")
-            return
-        sent_message = await message.answer("Настройки цен:", reply_markup=get_pricing_settings_menu())
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-    elif user_state.startswith('waiting_for_custom_date_') and user_id in admins:
-        username = user_state.split('waiting_for_custom_date_')[1]
-        try:
-            expiration = datetime.strptime(message.text.strip(), '%d-%m-%Y').replace(tzinfo=pytz.utc)
-            if expiration < datetime.now(pytz.utc):
-                await message.reply("Дата должна быть в будущем.")
-                return
-            db.set_user_expiration(username, expiration, "Неограниченно")
-            await message.reply(f"Подписка для {username} продлена до {expiration.strftime('%d-%m-%Y')}.")
-        except:
-            await message.reply("Введите дату в формате ДД-ММ-ГГГГ (например, 31-12-2025).")
-            return
-        sent_message = await message.answer("Выберите действие:", reply_markup=get_main_menu_markup(user_id))
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-
-@dp.callback_query_handler(lambda c: c.data == "settings")
-async def settings_menu_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip('-').isdigit():
+        await message.answer('Формат: /add_admin &lt;user_id&gt;')
         return
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Настройки:",
-        reply_markup=get_settings_menu()
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "pricing_settings")
-async def pricing_settings_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+    new_admin_id = int(parts[1])
+    if new_admin_id in SETTINGS.admin_ids:
+        await message.answer(f'{new_admin_id} уже администратор.')
         return
+    db.add_admin(new_admin_id)
+    SETTINGS.admin_ids.add(new_admin_id)
+    await message.answer(f'Админ {new_admin_id} добавлен.')
     try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Настройки цен:",
-        reply_markup=get_pricing_settings_menu()
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('set_price_'))
-async def set_price_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    period = callback_query.data.split('set_price_')[1]
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text=f"Введите новую цену для {period.replace('_', ' ')} в рублях (например, 1000.00):",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="pricing_settings"))
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': f'waiting_for_price_{period}'
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "add_user")
-async def prompt_for_user_name(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Введите имя пользователя:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': 'waiting_for_user_name'
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "add_admin")
-async def prompt_for_admin_id(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Введите Telegram ID нового админа:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("Отмена", callback_data="home"))
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': 'waiting_for_admin_id'
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('client_'))
-async def client_selected_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-
-    try:
-        username = callback_query.data.split('client_')[1]
-        clients = db.get_client_list()
-        client_info = next((c for c in clients if c[0] == username), None)
-        if not client_info:
-            await callback_query.answer("Пользователь не найден.", show_alert=True)
-            return
-
-        status = "🔴 Офлайн"
-        expiration = db.get_user_expiration(username)
-        expiration_text = expiration.strftime("%Y-%m-%d %H:%M UTC") if expiration else "Не установлен"
-
-        active_clients = db.get_active_list()
-        active_info = next((ac for ac in active_clients if ac[0] == username), None)
-        if active_info and active_info[1] and active_info[1].lower() not in ['never', 'нет данных', '-']:
-            try:
-                last_handshake = datetime.strptime(active_info[1], "%Y-%m-%d %H:%M:%S")
-                status = "🟢 Онлайн" if (datetime.now(pytz.utc) - last_handshake).total_seconds() <= 60 else "❌ Офлайн"
-            except:
-                pass
-
-        text = (
-            f"📧 *Имя:* {username}\n"
-            f"🌐 *Статус:* {status}\n"
-            f"⏰ *Срок действия:* {expiration_text}"
-        )
-
-        keyboard = InlineKeyboardMarkup(row_width=2).add(
-            InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_user_{username}"),
-            InlineKeyboardButton("🔄 Продлить", callback_data=f"renew_user_{username}"),
-            InlineKeyboardButton("⬅️ Назад", callback_data="list_users"),
-            InlineKeyboardButton("🏠 Домой", callback_data="home")
-        )
-
-        try:
-            await bot.delete_message(
-                chat_id=callback_query.message.chat.id,
-                message_id=callback_query.message.message_id
-            )
-        except:
-            pass
-        sent_message = await bot.send_message(
-            chat_id=callback_query.message.chat.id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-        await callback_query.answer()
-
+        await bot.send_message(new_admin_id, 'Вы назначены администратором!')
     except Exception as e:
-        logger.error(f"Ошибка в client_selected_callback: {str(e)}")
-        sent_message = await bot.send_message(
-            chat_id=callback_query.message.chat.id,
-            text=f"Ошибка при загрузке профиля: {str(e)}",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("⬅️ Назад", callback_data="list_users"),
-                InlineKeyboardButton("🏠 Домой", callback_data="home")
-            )
-        )
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-        await callback_query.answer("Ошибка на сервере.", show_alert=True)
+        logger.warning(f"Не удалось уведомить нового админа {new_admin_id}: {e}")
 
-@dp.callback_query_handler(lambda c: c.data == "list_users")
-async def list_users_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
+
+# --- Навигация --------------------------------------------------------------
+
+@router.callback_query(F.data == 'home')
+async def return_home(callback: CallbackQuery, state: FSMContext):
+    await show_main_menu(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'settings')
+async def settings_menu(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
         return
+    await state.clear()
+    await show(callback, 'Настройки:', kb.settings_menu())
+    await callback.answer()
 
-    try:
-        clients = db.get_client_list()
-        if not clients:
-            try:
-                await bot.delete_message(
-                    chat_id=callback_query.message.chat.id,
-                    message_id=callback_query.message.message_id
-                )
-            except:
-                pass
-            sent_message = await bot.send_message(
-                chat_id=callback_query.message.chat.id,
-                text="Список клиентов пуст.",
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("🏠 Домой", callback_data="home")
-                )
-            )
-            user_main_messages[user_id] = {
-                'chat_id': sent_message.chat.id,
-                'message_id': sent_message.message_id,
-                'state': None
-            }
-            await callback_query.answer()
-            return
 
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        active_clients = {client[0]: client[1] for client in db.get_active_list()}
-        for client in clients:
-            username = client[0]
-            last_handshake = active_clients.get(username)
-            status = "❌" if not last_handshake or last_handshake.lower() in ['never', 'нет данных', '-'] else "🟢"
-            button_text = f"{status} {username}"
-            keyboard.insert(InlineKeyboardButton(button_text, callback_data=f"client_{username}"))
+# --- Управление клиентами ---------------------------------------------------
 
-        keyboard.add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-
-        try:
-            await bot.delete_message(
-                chat_id=callback_query.message.chat.id,
-                message_id=callback_query.message.message_id
-            )
-        except:
-            pass
-        sent_message = await bot.send_message(
-            chat_id=callback_query.message.chat.id,
-            text="Выберите пользователя:",
-            reply_markup=keyboard
-        )
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-        await callback_query.answer()
-
-    except Exception as e:
-        logger.error(f"Ошибка в list_users_callback: {str(e)}")
-        sent_message = await bot.send_message(
-            chat_id=callback_query.message.chat.id,
-            text=f"Ошибка: {str(e)}",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("🏠 Домой", callback_data="home")
-            )
-        )
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-        await callback_query.answer("Ошибка на сервере.", show_alert=True)
-
-@dp.callback_query_handler(lambda c: c.data == "list_admins")
-async def list_admins_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+@router.callback_query(F.data == 'add_user')
+async def prompt_for_user_name(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
         return
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for admin_id in admins:
-        keyboard.insert(InlineKeyboardButton(f"🗑️ Удалить {admin_id}", callback_data=f"remove_admin_{admin_id}"))
-    keyboard.add(InlineKeyboardButton("⬅️ Назад", callback_data="settings"))
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text=f"Администраторы:\n" + "\n".join(f"- {admin_id}" for admin_id in admins),
-        reply_markup=keyboard
+    await state.set_state(Form.user_name)
+    await show(
+        callback,
+        'Введите имя пользователя (латиница, цифры, дефис и подчёркивание):',
+        kb.home_only(),
     )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+    await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('remove_admin_'))
-async def remove_admin_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    admin_id = int(callback_query.data.split('_')[2])
-    if admin_id not in admins or len(admins) <= 1:
-        await callback_query.answer("Нельзя удалить последнего админа или несуществующего.", show_alert=True)
-        return
-    db.remove_admin(admin_id)
-    admins.remove(admin_id)
-    await bot.send_message(admin_id, "Вы удалены из администраторов.")
-    await list_admins_callback(callback_query)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('delete_user_'))
-async def client_delete_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
+@router.message(Form.user_name)
+async def create_user(message: Message, state: FSMContext):
+    if not SETTINGS.is_staff(message.from_user.id):
+        await state.clear()
         return
-    username = callback_query.data.split('delete_user_')[1]
-    try:
-        if db.deactive_user_db(username):
-            shutil.rmtree(os.path.join('users', username), ignore_errors=True)
-            db.remove_user_expiration(username)
-            db.set_user_telegram_id(username, None)
-            logger.info(f"Пользователь {username} успешно удалён.")
-            text = f"Пользователь **{username}** удалён."
-        else:
-            logger.error(f"Не удалось удалить пользователя {username} через db.deactive_user_db.")
-            text = f"Не удалось удалить **{username}**. Проверьте логи."
-    except Exception as e:
-        logger.error(f"Ошибка при удалении пользователя {username}: {str(e)}")
-        text = f"Ошибка при удалении **{username}**: {str(e)}"
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
+    username = (message.text or '').strip()
+    if not config.USERNAME_RE.match(username):
+        await message.reply('Имя может содержать только латинские буквы, цифры, - и _.')
+        return
+    if vpn.client_conf_path(username).exists():
+        await message.reply('Клиент с таким именем уже существует.')
+        return
+
+    status = await message.answer('Создаю клиента, это займёт несколько секунд...')
+    created = await vpn.create_client(username, SETTINGS)
+    await status.delete()
+
+    if created:
+        db.set_user_telegram_id(username, message.from_user.id)
+        await send_client_config(message.chat.id, username)
+    else:
+        await message.answer(
+            'Не удалось создать клиента. Проверьте логи бота и доступность контейнера '
+            f'<code>{esc(SETTINGS.docker_container)}</code>.'
         )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text=text,
-        parse_mode="Markdown",
-        reply_markup=get_main_menu_markup(user_id)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+    await show_main_menu(message, state)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('renew_user_'))
-async def renew_user_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+
+@router.callback_query(F.data == 'list_users')
+async def list_users(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
         return
-    username = callback_query.data.split('renew_user_')[1]
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите период продления или укажите дату:",
-        reply_markup=get_renewal_period_keyboard(username)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('renew_period_'))
-async def renew_period_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    try:
-        parts = callback_query.data.split('renew_period_')[1].split('_', 1)
-        username = parts[0]
-        period = parts[1] if len(parts) > 1 else 'custom_date'
-        if period == 'custom_date':
-            try:
-                await bot.delete_message(
-                    chat_id=callback_query.message.chat.id,
-                    message_id=callback_query.message.message_id
-                )
-            except:
-                pass
-            sent_message = await bot.send_message(
-                chat_id=callback_query.message.chat.id,
-                text="Введите дату продления в формате ДД-ММ-ГГГГ (например, 31-12-2025):",
-                reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("Отмена", callback_data="home"))
-            )
-            user_main_messages[user_id] = {
-                'chat_id': sent_message.chat.id,
-                'message_id': sent_message.message_id,
-                'state': f'waiting_for_custom_date_{username}'
-            }
-        else:
-            months = {'1_month': 1, '3_months': 3, '6_months': 6, '12_months': 12}[period]
-            expiration = datetime.now(pytz.utc) + timedelta(days=30 * months)
-            db.set_user_expiration(username, expiration, "Неограниченно")
-            text = f"Подписка для {username} продлена до {expiration.strftime('%Y-%m-%d %H:%M UTC')}."
-            logger.info(f"Подписка для {username} продлена на {period} до {expiration}.")
-            try:
-                await bot.delete_message(
-                    chat_id=callback_query.message.chat.id,
-                    message_id=callback_query.message.message_id
-                )
-            except:
-                pass
-            sent_message = await bot.send_message(
-                chat_id=callback_query.message.chat.id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=get_main_menu_markup(user_id)
-            )
-            user_main_messages[user_id] = {
-                'chat_id': sent_message.chat.id,
-                'message_id': sent_message.message_id,
-                'state': None
-            }
-        await callback_query.answer()
-    except Exception as e:
-        text = f"Ошибка при продлении: {str(e)}"
-        logger.error(f"Ошибка при продлении подписки для {username}: {str(e)}")
-        sent_message = await bot.send_message(
-            chat_id=callback_query.message.chat.id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=get_main_menu_markup(user_id)
-        )
-        user_main_messages[user_id] = {
-            'chat_id': sent_message.chat.id,
-            'message_id': sent_message.message_id,
-            'state': None
-        }
-        await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "home")
-async def return_home(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите действие:",
-        reply_markup=get_main_menu_markup(user_id)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "get_config")
-async def list_users_for_config(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
+    await state.clear()
     clients = db.get_client_list()
     if not clients:
-        await callback_query.answer("Список пуст.", show_alert=True)
+        await show(callback, 'Список клиентов пуст.', kb.home_only())
+        await callback.answer()
         return
 
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for client in clients:
-        keyboard.insert(InlineKeyboardButton(client[0], callback_data=f"send_config_{client[0]}"))
-    keyboard.add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите пользователя:",
-        reply_markup=keyboard
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+    active = await vpn.active_clients(SETTINGS)
+    now = datetime.now(pytz.utc)
+    rows = []
+    for username, _ in clients:
+        handshake = active.get(username)
+        online = handshake and (now - handshake).total_seconds() <= ONLINE_THRESHOLD_SECONDS
+        rows.append((username, '🟢' if online else '❌'))
 
-@dp.callback_query_handler(lambda c: c.data.startswith('send_config_'))
-async def send_user_config(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins and user_id not in moderators:
-        await callback_query.answer("Нет прав.", show_alert=True)
+    await show(callback, 'Выберите пользователя:', kb.client_list(rows, 'client'))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('client:'))
+async def client_selected(callback: CallbackQuery):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
         return
-    username = callback_query.data.split('send_config_')[1]
-    conf_path = os.path.join('users', username, f'{username}.conf')
-    if os.path.exists(conf_path):
-        vpn_key = await generate_vpn_key(conf_path)
-        caption = f"Конфигурация для {username}:\nAmneziaVPN:\n[Google Play](https://play.google.com/store/apps/details?id=org.amnezia.vpn&hl=ru)\n[GitHub](https://github.com/amnezia-vpn/amnezia-client)\n```\n{vpn_key}\n```"
-        with open(conf_path, 'rb') as config:
-            config_message = await bot.send_document(user_id, config, caption=caption, parse_mode="Markdown")
-            await bot.pin_chat_message(user_id, config_message.message_id, disable_notification=True)
+    username = callback.data.split(':', 1)[1]
+    if not vpn.client_conf_path(username).exists():
+        await callback.answer('Пользователь не найден.', show_alert=True)
+        return
+
+    active = await vpn.active_clients(SETTINGS)
+    handshake = active.get(username)
+    now = datetime.now(pytz.utc)
+    if handshake and (now - handshake).total_seconds() <= ONLINE_THRESHOLD_SECONDS:
+        status = '🟢 Онлайн'
+    elif handshake:
+        status = f'🔴 Офлайн (последний handshake {handshake.strftime("%d.%m.%Y %H:%M UTC")})'
     else:
-        await bot.send_message(user_id, f"Конфигурация для **{username}** не найдена.", parse_mode="Markdown")
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите действие:",
-        reply_markup=get_main_menu_markup(user_id)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+        status = '🔴 Не подключался'
 
-@dp.callback_query_handler(lambda c: c.data == "create_backup")
-async def create_backup_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+    owner = db.get_user_telegram_id(username)
+    text = (
+        f'📧 <b>Имя:</b> {esc(username)}\n'
+        f'🌐 <b>Статус:</b> {esc(status)}\n'
+        f'⏰ <b>Срок действия:</b> {esc(format_expiration(db.get_user_expiration(username)))}\n'
+        f'👤 <b>Владелец:</b> {esc(owner) if owner else "не привязан"}'
+    )
+    await show(callback, text, kb.client_actions(username))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('delete:'))
+async def delete_client(callback: CallbackQuery):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
         return
-    backup_filename = f"backup_{datetime.now().strftime('%Y-%m-%d')}.zip"
-    with zipfile.ZipFile(backup_filename, 'w') as zipf:
-        for file in ['awg-decode.py', 'newclient.sh', 'removeclient.sh']:
-            if os.path.exists(file):
-                zipf.write(file)
-        for root, _, files in os.walk('files'):
-            for file in files:
-                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), os.getcwd()))
-        for root, _, files in os.walk('users'):
-            for file in files:
-                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), os.getcwd()))
-    with open(backup_filename, 'rb') as f:
-        await bot.send_document(user_id, f, caption=backup_filename)
-    os.remove(backup_filename)
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите действие:",
-        reply_markup=get_main_menu_markup(user_id)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+    username = callback.data.split(':', 1)[1]
+    await callback.answer('Удаляю...')
+    if await vpn.delete_client(username, SETTINGS):
+        text = f'Пользователь <b>{esc(username)}</b> удалён.'
+        logger.info(f"Пользователь {username} удалён.")
+    else:
+        text = f'Не удалось удалить <b>{esc(username)}</b>. Проверьте логи.'
+    await show(callback, text, kb.main_menu(callback.from_user.id, SETTINGS))
 
-@dp.callback_query_handler(lambda c: c.data == "buy_key")
-async def buy_key_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
+
+@router.callback_query(F.data.startswith('sendconf:'))
+async def send_config_to_staff(callback: CallbackQuery):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
+        return
+    username = callback.data.split(':', 1)[1]
+    await callback.answer()
+    await send_client_config(chat_id_of(callback), username)
+
+
+@router.callback_query(F.data == 'get_config')
+async def list_users_for_config(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_staff(callback.from_user.id):
+        await deny(callback)
+        return
+    await state.clear()
+    clients = db.get_client_list()
+    if not clients:
+        await show(callback, 'Список клиентов пуст.', kb.home_only())
+        await callback.answer()
+        return
+    rows = [(username, '') for username, _ in clients]
+    await show(callback, 'Выберите пользователя:', kb.client_list(rows, 'sendconf'))
+    await callback.answer()
+
+
+# --- Продление подписки -----------------------------------------------------
+
+@router.callback_query(F.data.startswith('renew:'))
+async def renew_prompt(callback: CallbackQuery):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    username = callback.data.split(':', 1)[1]
+    await show(callback, 'Выберите период продления или укажите дату:', kb.renewal_periods(username))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('renewp:'))
+async def renew_period(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    _, username, period = callback.data.split(':', 2)
+
+    if period == 'custom':
+        await state.set_state(Form.custom_date)
+        await state.update_data(username=username)
+        await show(
+            callback,
+            'Введите дату окончания подписки в формате ДД-ММ-ГГГГ (например, 31-12-2026):',
+            kb.single('Отмена', f'client:{username}'),
         )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Меню получения ключа:",
-        reply_markup=get_buy_key_menu(user_id)
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
+        await callback.answer()
+        return
 
-@dp.callback_query_handler(lambda c: c.data == "use_promocode")
-async def use_promocode_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
+    if period not in config.PERIODS:
+        await callback.answer('Неизвестный период.', show_alert=True)
+        return
+
+    expiration = vpn.extend_subscription(username, period)
+    logger.info(f"Подписка {username} продлена на {period} до {expiration}.")
+    await show(
+        callback,
+        f'Подписка для <b>{esc(username)}</b> продлена до {esc(format_expiration(expiration))}.',
+        kb.main_menu(callback.from_user.id, SETTINGS),
+    )
+    await callback.answer()
+
+
+@router.message(Form.custom_date)
+async def set_custom_date(message: Message, state: FSMContext):
+    if not SETTINGS.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    username = data.get('username')
     try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Введите промокод для получения ключа:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
+        expiration = datetime.strptime((message.text or '').strip(), '%d-%m-%Y').replace(tzinfo=pytz.utc)
+    except ValueError:
+        await message.reply('Введите дату в формате ДД-ММ-ГГГГ (например, 31-12-2026).')
+        return
+    if expiration < datetime.now(pytz.utc):
+        await message.reply('Дата должна быть в будущем.')
+        return
+    db.set_user_expiration(username, expiration)
+    await message.reply(
+        f'Подписка для <b>{esc(username)}</b> продлена до {esc(format_expiration(expiration))}.'
     )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': 'waiting_for_promocode'
-    }
-    await callback_query.answer()
+    await show_main_menu(message, state)
 
-@dp.callback_query_handler(lambda c: c.data == "manage_promocodes")
-async def manage_promocodes_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+
+# --- Администраторы ---------------------------------------------------------
+
+@router.callback_query(F.data == 'list_admins')
+async def list_admins(callback: CallbackQuery):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    text = 'Администраторы:\n' + '\n'.join(f'• <code>{admin_id}</code>' for admin_id in sorted(SETTINGS.admin_ids))
+    await show(callback, text, kb.admin_list(SETTINGS.admin_ids))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('rmadmin:'))
+async def remove_admin(callback: CallbackQuery):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    admin_id = int(callback.data.split(':', 1)[1])
+    if admin_id not in SETTINGS.admin_ids:
+        await callback.answer('Администратор не найден.', show_alert=True)
+        return
+    if len(SETTINGS.admin_ids) <= 1:
+        await callback.answer('Нельзя удалить последнего администратора.', show_alert=True)
+        return
+    db.remove_admin(admin_id)
+    SETTINGS.admin_ids.discard(admin_id)
+    try:
+        await bot.send_message(admin_id, 'Вы удалены из администраторов.')
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить снятого админа {admin_id}: {e}")
+    await callback.answer('Администратор удалён.')
+    await list_admins(callback)
+
+
+@router.callback_query(F.data == 'add_admin')
+async def prompt_for_admin_id(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    await state.set_state(Form.admin_id)
+    await show(callback, 'Введите Telegram ID нового администратора:', kb.single('Отмена', 'settings'))
+    await callback.answer()
+
+
+@router.message(Form.admin_id)
+async def add_admin_from_state(message: Message, state: FSMContext):
+    if not SETTINGS.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or '').strip()
+    if not raw.lstrip('-').isdigit():
+        await message.reply('Введите корректный числовой Telegram ID.')
+        return
+    new_admin_id = int(raw)
+    if new_admin_id in SETTINGS.admin_ids:
+        await message.reply('Этот пользователь уже администратор.')
+    else:
+        db.add_admin(new_admin_id)
+        SETTINGS.admin_ids.add(new_admin_id)
+        await message.reply(f'Админ {new_admin_id} добавлен.')
+        try:
+            await bot.send_message(new_admin_id, 'Вы назначены администратором!')
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить нового админа {new_admin_id}: {e}")
+    await show_main_menu(message, state)
+
+
+# --- Цены -------------------------------------------------------------------
+
+@router.callback_query(F.data == 'pricing_settings')
+async def pricing_settings(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    await state.clear()
+    await show(callback, 'Настройки цен — выберите период:', kb.pricing_settings_menu(SETTINGS))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('setprice:'))
+async def set_price_prompt(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    period = callback.data.split(':', 1)[1]
+    if period not in config.PERIODS:
+        await callback.answer('Неизвестный период.', show_alert=True)
+        return
+    await state.set_state(Form.price)
+    await state.update_data(period=period)
+    await show(
+        callback,
+        f'Введите новую цену для периода «{esc(config.period_label(period))}» в рублях (например, 1000):',
+        kb.single('⬅️ Назад', 'pricing_settings'),
+    )
+    await callback.answer()
+
+
+@router.message(Form.price)
+async def set_price(message: Message, state: FSMContext):
+    if not SETTINGS.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    period = data.get('period')
+    try:
+        price = float((message.text or '').strip().replace(',', '.'))
+    except ValueError:
+        await message.reply('Введите корректное число (например, 1000).')
+        return
+    if price <= 0:
+        await message.reply('Цена должна быть больше нуля.')
+        return
+    if SETTINGS.currency == 'RUB' and price < settings_module.MIN_INVOICE_RUB:
+        await message.reply(
+            f'Telegram не принимает счета меньше {settings_module.MIN_INVOICE_RUB:g} ₽. '
+            'Укажите большую сумму.'
+        )
+        return
+
+    db.set_pricing(period, price)
+    SETTINGS.pricing[period] = price
+    await message.reply(f'Цена для «{esc(config.period_label(period))}» обновлена: {price:.2f} ₽')
+    await state.clear()
+    await message.answer('Настройки цен — выберите период:', reply_markup=kb.pricing_settings_menu(SETTINGS))
+
+
+# --- Промокоды --------------------------------------------------------------
+
+@router.callback_query(F.data == 'manage_promocodes')
+async def manage_promocodes(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    await state.clear()
+    promocodes = db.get_promocodes()
+    if promocodes:
+        lines = []
+        for code, info in promocodes.items():
+            expires = info['expires_at'].strftime('%d.%m.%Y') if info['expires_at'] else 'бессрочно'
+            lines.append(
+                f"<code>{esc(code)}</code> — скидка {info['discount']:g}%, "
+                f"использован {info['uses']}/{info['max_uses'] or '∞'}, до {expires}, "
+                f"период: {esc(config.period_label(info['subscription_period'])) if info['subscription_period'] else 'нет'}"
+            )
+        text = 'Промокоды:\n' + '\n'.join(lines)
+    else:
+        text = 'Промокоды отсутствуют.'
+    await show(callback, text, kb.promocodes_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'add_promocode')
+async def add_promocode_prompt(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    await state.set_state(Form.new_promocode)
+    await show(
+        callback,
+        'Введите промокод в формате:\n'
+        '<code>&lt;код&gt; &lt;скидка%&gt; &lt;дней_действия&gt; &lt;макс_использований|none&gt; &lt;период|none&gt;</code>\n\n'
+        'Период выдаёт ключ бесплатно, скидка — уменьшает цену при оплате.\n'
+        'Примеры:\n'
+        '<code>FREE1M 100 30 10 1_month</code> — бесплатный ключ на месяц, 10 активаций\n'
+        '<code>SALE20 20 30 none none</code> — скидка 20% при оплате, без лимита',
+        kb.single('⬅️ Назад', 'manage_promocodes'),
+    )
+    await callback.answer()
+
+
+@router.message(Form.new_promocode)
+async def add_promocode(message: Message, state: FSMContext):
+    if not SETTINGS.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    hint = (
+        'Формат: <code>&lt;код&gt; &lt;скидка%&gt; &lt;дней&gt; &lt;макс_использований|none&gt; &lt;период|none&gt;</code>\n'
+        'Пример: <code>SALE20 20 30 none none</code>'
+    )
+    parts = (message.text or '').strip().split()
+    if len(parts) != 5:
+        await message.reply(hint)
+        return
+    code, raw_discount, raw_days, raw_max_uses, period = parts
+    try:
+        discount = float(raw_discount.replace(',', '.'))
+        days_valid = int(raw_days)
+    except ValueError:
+        await message.reply(hint)
+        return
+    if not 0 <= discount <= 100:
+        await message.reply('Скидка должна быть от 0 до 100.')
+        return
+    if raw_max_uses.lower() == 'none':
+        max_uses = None
+    elif raw_max_uses.isdigit() and int(raw_max_uses) > 0:
+        max_uses = int(raw_max_uses)
+    else:
+        await message.reply('Максимум использований — положительное число или <code>none</code>.')
+        return
+    if period.lower() == 'none':
+        period = None
+    elif period not in config.PERIODS:
+        await message.reply(f"Период должен быть одним из: {', '.join(config.PERIODS)} или <code>none</code>.")
+        return
+    if period is None and discount <= 0:
+        await message.reply('Промокод без периода и без скидки бесполезен.')
+        return
+
+    expires_at = datetime.now(pytz.utc) + timedelta(days=days_valid) if days_valid > 0 else None
+
+    if db.add_promocode(code, discount, expires_at, max_uses, period):
+        await message.reply(
+            f'Промокод <code>{esc(code)}</code> добавлен: скидка {discount:g}%, '
+            f"действует {days_valid if days_valid > 0 else '∞'} дней, "
+            f"использований: {max_uses or '∞'}, "
+            f"период: {esc(config.period_label(period)) if period else 'нет'}."
+        )
+    else:
+        await message.reply('Такой промокод уже существует.')
+    await state.clear()
+    await message.answer('Управление промокодами:', reply_markup=kb.promocodes_menu())
+
+
+@router.callback_query(F.data == 'delete_promocode')
+async def delete_promocode_menu(callback: CallbackQuery):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
         return
     promocodes = db.get_promocodes()
-    text = "Промокоды:\n" + "\n".join(
-        f"{code}: {info['discount']}% (использовано {info['uses']}/{info['max_uses'] or '∞'}, до {info['expires_at'].strftime('%Y-%m-%d %H:%M UTC') if info['expires_at'] else 'неограничено'}, период подписки: {info['subscription_period'] or 'нет'})"
-        for code, info in promocodes.items()
-    ) if promocodes else "Промокоды отсутствуют."
-    keyboard = InlineKeyboardMarkup(row_width=2).add(
-        InlineKeyboardButton("➕ Добавить промокод", callback_data="add_promocode"),
-        InlineKeyboardButton("🗑️ Удалить промокод", callback_data="delete_promocode"),
-        InlineKeyboardButton("🏠 Домой", callback_data="home")
-    )
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text=text,
-        reply_markup=keyboard
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "add_promocode")
-async def add_promocode_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+    if not promocodes:
+        await callback.answer('Промокоды отсутствуют.', show_alert=True)
         return
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Введите промокод в формате: <код> <скидка%> <дней_действия> <макс_использований|none> <период_подписки|none>\nПример: PROMO1 10 30 none 1_month",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': 'waiting_for_new_promocode'
-    }
-    await callback_query.answer()
+    await show(callback, 'Выберите промокод для удаления:', kb.promocode_list(promocodes))
+    await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "delete_promocode")
-async def delete_promocode_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
-        return
-    promocodes = db.get_promocodes()
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for code in promocodes:
-        keyboard.insert(InlineKeyboardButton(f"🗑️ {code}", callback_data=f"remove_promocode_{code}"))
-    keyboard.add(InlineKeyboardButton("🏠 Домой", callback_data="home"))
-    try:
-        await bot.delete_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id
-        )
-    except:
-        pass
-    sent_message = await bot.send_message(
-        chat_id=callback_query.message.chat.id,
-        text="Выберите промокод для удаления:",
-        reply_markup=keyboard
-    )
-    user_main_messages[user_id] = {
-        'chat_id': sent_message.chat.id,
-        'message_id': sent_message.message_id,
-        'state': None
-    }
-    await callback_query.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('remove_promocode_'))
-async def remove_promocode_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in admins:
-        await callback_query.answer("Нет прав.", show_alert=True)
+@router.callback_query(F.data.startswith('rmpromo:'))
+async def remove_promocode(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
         return
-    code = callback_query.data.split('remove_promocode_')[1]
+    code = callback.data.split(':', 1)[1]
     if db.remove_promocode(code):
-        await callback_query.answer(f"Промокод {code} удалён.", show_alert=True)
+        await callback.answer(f'Промокод {code} удалён.')
     else:
-        await callback_query.answer(f"Промокод {code} не найден.", show_alert=True)
-    await manage_promocodes_callback(callback_query)
+        await callback.answer(f'Промокод {code} не найден.', show_alert=True)
+    await manage_promocodes(callback, state)
+
+
+@router.callback_query(F.data == 'use_promocode')
+async def use_promocode_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.promocode)
+    await show(callback, 'Введите промокод:', kb.home_only())
+    await callback.answer()
+
+
+@router.message(Form.promocode)
+async def apply_promocode(message: Message, state: FSMContext):
+    code = (message.text or '').strip()
+    promo = db.validate_promocode(code)
+    if not promo:
+        await message.reply('Неверный или истёкший промокод.')
+        await show_main_menu(message, state)
+        return
+
+    period = promo['subscription_period']
+    if period:
+        # Промокод сразу выдаёт ключ — оплата не нужна.
+        status = await message.answer('Создаю ключ, это займёт несколько секунд...')
+        username = await vpn.issue_subscription(message.from_user.id, period, SETTINGS)
+        await status.delete()
+        if username:
+            db.consume_promocode(code)
+            await send_client_config(
+                message.chat.id, username,
+                header=f'Ваш VPN-ключ на {esc(config.period_label(period))}',
+            )
+            await message.answer(
+                f'Промокод активирован. Подписка действует до '
+                f'{esc(format_expiration(db.get_user_expiration(username)))}.'
+            )
+        else:
+            await message.answer('Не удалось выдать ключ. Обратитесь к администратору.')
+            await notify_admins(
+                f'❗ Не удалось выдать ключ по промокоду {code} пользователю {message.from_user.id}.'
+            )
+        await show_main_menu(message, state)
+        return
+
+    # Промокод только со скидкой — запоминаем и показываем цены со скидкой.
+    if not SETTINGS.payments_enabled:
+        await message.reply('Оплата сейчас недоступна, а этот промокод даёт только скидку.')
+        await show_main_menu(message, state)
+        return
+
+    await state.clear()
+    await state.update_data(promocode=code, discount=promo['discount'])
+    await message.answer(
+        f"Промокод <code>{esc(code)}</code> принят: скидка {promo['discount']:g}%.\n"
+        'Выберите период подписки:',
+        reply_markup=kb.buy_menu(SETTINGS, promo['discount']),
+    )
+
+
+# --- Оплата (встроенные платежи Telegram) -----------------------------------
+
+@router.callback_query(F.data == 'buy_key')
+async def buy_key_menu(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.payments_enabled:
+        await callback.answer('Оплата не настроена. Используйте промокод.', show_alert=True)
+        return
+    data = await state.get_data()
+    discount = data.get('discount', 0.0)
+    text = 'Выберите период подписки:'
+    if discount:
+        text = f"Скидка по промокоду {esc(data.get('promocode'))}: {discount:g}%\n{text}"
+    await show(callback, text, kb.buy_menu(SETTINGS, discount))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('buy:'))
+async def send_invoice(callback: CallbackQuery, state: FSMContext):
+    if not SETTINGS.payments_enabled:
+        await callback.answer('Оплата не настроена.', show_alert=True)
+        return
+    period = callback.data.split(':', 1)[1]
+    if period not in config.PERIODS:
+        await callback.answer('Неизвестный период.', show_alert=True)
+        return
+
+    data = await state.get_data()
+    promocode = data.get('promocode')
+    discount = data.get('discount', 0.0)
+    # Промокод мог быть израсходован, пока пользователь выбирал период.
+    if promocode and not db.validate_promocode(promocode):
+        promocode, discount = None, 0.0
+        await bot.send_message(chat_id_of(callback), 'Промокод больше не действует, счёт выставлен без скидки.')
+
+    price = payments.final_price(SETTINGS, period, discount)
+    if price <= 0:
+        # Скидка 100% — счёт выставлять не нужно, выдаём ключ сразу.
+        await callback.answer()
+        await grant_paid_subscription(
+            callback.from_user.id, chat_id_of(callback), period, promocode,
+            amount=0, currency=SETTINGS.currency, charge_id=f'promo:{promocode}:{callback.from_user.id}',
+        )
+        await state.clear()
+        return
+
+    if SETTINGS.currency == 'RUB' and price < settings_module.MIN_INVOICE_RUB:
+        await callback.answer(
+            f'Итоговая сумма {price:.2f} ₽ меньше минимальной для Telegram '
+            f'({settings_module.MIN_INVOICE_RUB:g} ₽).',
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    try:
+        await bot.send_invoice(
+            chat_id_of(callback),
+            **payments.build_invoice(SETTINGS, period, discount, promocode),
+        )
+    except TelegramBadRequest as e:
+        logger.error(f"Не удалось выставить счёт: {e}")
+        await bot.send_message(
+            chat_id_of(callback),
+            'Не удалось выставить счёт. Проверьте токен платёжного провайдера в настройках бота.',
+        )
+
+
+@payment_router.pre_checkout_query()
+async def process_pre_checkout(query: PreCheckoutQuery):
+    """Telegram ждёт ответ в течение 10 секунд, иначе оплата отменяется."""
+    period, _ = payments.parse_payload(query.invoice_payload)
+    if not SETTINGS.payments_enabled or not period:
+        await query.answer(ok=False, error_message='Счёт устарел, оформите заказ заново.')
+        return
+    await query.answer(ok=True)
+
+
+@payment_router.message(F.successful_payment)
+async def process_successful_payment(message: Message, state: FSMContext):
+    payment = message.successful_payment
+    period, promocode = payments.parse_payload(payment.invoice_payload)
+    charge_id = payment.provider_payment_charge_id or payment.telegram_payment_charge_id
+
+    if not period:
+        logger.error(f"Оплата {charge_id} с нераспознанным payload: {payment.invoice_payload!r}")
+        await message.answer('Оплата получена, но заказ не распознан. Обратитесь к администратору.')
+        await notify_admins(f'❗ Оплата {charge_id} с некорректным payload: {payment.invoice_payload!r}')
+        return
+
+    await state.clear()
+    await grant_paid_subscription(
+        message.from_user.id, message.chat.id, period, promocode,
+        amount=payment.total_amount / 100, currency=payment.currency, charge_id=charge_id,
+    )
+
+
+async def grant_paid_subscription(user_id, chat_id, period, promocode, amount, currency, charge_id):
+    """Выдаёт ключ после оплаты. Повторная доставка платежа ключ не дублирует."""
+    if db.is_payment_recorded(charge_id):
+        logger.info(f"Платёж {charge_id} уже обработан — повторная выдача пропущена.")
+        return
+
+    status = await bot.send_message(chat_id, 'Оплата получена. Создаю ключ...')
+    username = await vpn.issue_subscription(user_id, period, SETTINGS)
+    await status.delete()
+
+    if not username:
+        # Деньги списаны, а ключ не создан — это должен увидеть администратор.
+        logger.error(f"Не удалось создать клиента после оплаты {charge_id} (пользователь {user_id}).")
+        await bot.send_message(
+            chat_id,
+            'Оплата прошла, но выдать ключ автоматически не получилось. '
+            'Администратор уже уведомлён и свяжется с вами.',
+        )
+        await notify_admins(
+            f'❗ Оплата {charge_id} на {amount} {currency} от пользователя {user_id} '
+            f'прошла, но клиент не создан. Требуется ручная выдача ключа.'
+        )
+        return
+
+    db.record_payment(charge_id, user_id, username, period, amount, currency, promocode)
+    if promocode:
+        db.consume_promocode(promocode)
+
+    await send_client_config(
+        chat_id, username, header=f'Ваш VPN-ключ на {esc(config.period_label(period))}',
+    )
+    await bot.send_message(
+        chat_id,
+        f'Подписка активна до {esc(format_expiration(db.get_user_expiration(username)))}.',
+        reply_markup=kb.main_menu(user_id, SETTINGS),
+    )
+
+
+# --- Ключи пользователя -----------------------------------------------------
+
+@router.callback_query(F.data == 'my_keys')
+async def my_keys(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    usernames = db.get_usernames_by_telegram_id(callback.from_user.id)
+    usernames = [name for name in usernames if vpn.client_conf_path(name).exists()]
+    if not usernames:
+        await show(callback, 'У вас пока нет ключей.', kb.main_menu(callback.from_user.id, SETTINGS))
+        await callback.answer()
+        return
+
+    lines = []
+    for name in usernames:
+        lines.append(f'• <code>{esc(name)}</code> — до {esc(format_expiration(db.get_user_expiration(name)))}')
+    await show(callback, 'Ваши ключи:\n' + '\n'.join(lines), kb.main_menu(callback.from_user.id, SETTINGS))
+    await callback.answer()
+    for name in usernames:
+        await send_client_config(chat_id_of(callback), name)
+
+
+# --- Резервное копирование --------------------------------------------------
+
+@router.callback_query(F.data == 'create_backup')
+async def create_backup(callback: CallbackQuery):
+    if not SETTINGS.is_admin(callback.from_user.id):
+        await deny(callback)
+        return
+    await callback.answer('Готовлю бэкап...')
+
+    backup_path = config.BASE_DIR / f"backup_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.zip"
+    try:
+        await asyncio.to_thread(_write_backup, backup_path)
+        await bot.send_document(
+            chat_id_of(callback),
+            FSInputFile(backup_path, filename=backup_path.name),
+            caption='Резервная копия конфигураций и данных бота.',
+        )
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+        await bot.send_message(chat_id_of(callback), f'Не удалось создать бэкап: {esc(e)}')
+    finally:
+        backup_path.unlink(missing_ok=True)
+
+
+def _write_backup(backup_path):
+    """Складывает в архив скрипты, files/ и users/."""
+    with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for name in ('awg_decode.py', 'newclient.sh', 'removeclient.sh'):
+            script = config.BASE_DIR / name
+            if script.exists():
+                archive.write(script, name)
+        for directory in (config.FILES_DIR, config.USERS_DIR):
+            if not directory.exists():
+                continue
+            for path in directory.rglob('*'):
+                if path.is_file():
+                    archive.write(path, path.relative_to(config.BASE_DIR))
+
+
+# --- Истечение подписок -----------------------------------------------------
+
+async def enforce_expirations():
+    """Удаляет клиентов с истёкшей подпиской и сообщает об этом владельцам."""
+    now = datetime.now(pytz.utc)
+    for username, expiration in db.get_all_expirations().items():
+        if not expiration or expiration > now:
+            continue
+        if not vpn.client_conf_path(username).exists():
+            db.remove_user_expiration(username)
+            continue
+
+        owner = db.get_user_telegram_id(username)
+        logger.info(f"Подписка {username} истекла {expiration} — удаляю клиента.")
+        if not await vpn.delete_client(username, SETTINGS):
+            logger.error(f"Не удалось удалить клиента {username} с истёкшей подпиской.")
+            continue
+        if owner:
+            try:
+                await bot.send_message(
+                    owner,
+                    f'Срок действия ключа <code>{esc(username)}</code> истёк, доступ отключён.',
+                    reply_markup=kb.main_menu(owner, SETTINGS),
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить {owner} об истечении подписки: {e}")
+
+
+# --- Фолбэк для сообщений вне диалогов --------------------------------------
+
+@router.message(F.text)
+async def fallback(message: Message, state: FSMContext):
+    """Любое сообщение вне диалога возвращает пользователя в главное меню."""
+    if await state.get_state() is None:
+        await show_main_menu(message, state)
+
+
+# --- Запуск -----------------------------------------------------------------
+
+async def main():
+    scheduler.add_job(enforce_expirations, 'interval', hours=1, next_run_time=datetime.now(pytz.utc))
+    scheduler.start()
+    logger.info(
+        f"Бот запущен. Каталог: {config.BASE_DIR}. "
+        f"Оплата: {'включена' if SETTINGS.payments_enabled else 'отключена'}."
+    )
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
+        await bot.session.close()
+
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info('Бот остановлен.')
