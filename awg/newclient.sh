@@ -32,7 +32,8 @@ if [[ ! "$CLIENT_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     exit 1
 fi
 
-pwd=$(pwd)
+# Каталог скрипта, а не текущий каталог: бот может быть запущен откуда угодно.
+pwd="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$pwd/users/$CLIENT_NAME"
 mkdir -p "$pwd/files"
 

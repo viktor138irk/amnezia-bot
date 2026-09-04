@@ -1,165 +1,273 @@
+"""Хранилище данных бота (JSON-файлы) и операции с клиентами WireGuard."""
 import json
-import os
-import subprocess
 import logging
+import re
+import subprocess
 from datetime import datetime
-import pytz
-import shutil
 
-logging.basicConfig(level=logging.INFO)
+import pytz
+
+import config
+
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = 'files/config.json'
-USER_EXPIRATION_FILE = 'files/user_expiration.json'
-USER_TELEGRAM_FILE = 'files/user_telegram.json'
-PROMOCODES_FILE = 'files/promocodes.json'
 
 def load_json(file_path, default=None):
     """Загружает JSON-файл, возвращает default при ошибке или отсутствии файла."""
     try:
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
+        if file_path.exists():
+            with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception as e:
-        logger.error(f"Ошибка загрузки {file_path}: {str(e)}")
+        logger.error(f"Ошибка загрузки {file_path}: {e}")
     return default if default is not None else {}
 
+
 def save_json(file_path, data):
-    """Сохраняет данные в JSON-файл."""
+    """Сохраняет данные в JSON-файл (атомарно, через временный файл)."""
     try:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, 'w') as f:
-            json.dump(data, f, indent=4, default=str)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = file_path.with_suffix(file_path.suffix + '.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False, default=str)
+        tmp_path.replace(file_path)
         return True
     except Exception as e:
-        logger.error(f"Ошибка сохранения {file_path}: {str(e)}")
+        logger.error(f"Ошибка сохранения {file_path}: {e}")
         return False
+
+
+# --- Конфигурация -----------------------------------------------------------
 
 def get_config():
     """Возвращает конфигурацию из config.json."""
-    return load_json(CONFIG_FILE, {})
+    return load_json(config.CONFIG_FILE, {})
+
+
+def save_config(cfg):
+    """Сохраняет конфигурацию в config.json."""
+    return save_json(config.CONFIG_FILE, cfg)
+
 
 def add_admin(admin_id):
     """Добавляет ID администратора в конфигурацию."""
-    config = get_config()
-    admin_ids = config.get('admin_ids', [])
+    cfg = get_config()
+    admin_ids = [str(a) for a in cfg.get('admin_ids', [])]
     if str(admin_id) not in admin_ids:
         admin_ids.append(str(admin_id))
-        config['admin_ids'] = admin_ids
-        save_json(CONFIG_FILE, config)
+        cfg['admin_ids'] = admin_ids
+        save_config(cfg)
+
 
 def remove_admin(admin_id):
     """Удаляет ID администратора из конфигурации."""
-    config = get_config()
-    admin_ids = config.get('admin_ids', [])
-    admin_id_str = str(admin_id)
-    if admin_id_str in admin_ids:
-        admin_ids.remove(admin_id_str)
-        config['admin_ids'] = admin_ids
-        save_json(CONFIG_FILE, config)
+    cfg = get_config()
+    admin_ids = [str(a) for a in cfg.get('admin_ids', [])]
+    if str(admin_id) in admin_ids:
+        admin_ids.remove(str(admin_id))
+        cfg['admin_ids'] = admin_ids
+        save_config(cfg)
+
 
 def set_pricing(period, price):
     """Устанавливает цену для указанного периода подписки."""
-    config = get_config()
-    config['pricing'] = config.get('pricing', {})
-    config['pricing'][period] = price
-    save_json(CONFIG_FILE, config)
+    cfg = get_config()
+    pricing = cfg.get('pricing', dict(config.DEFAULT_PRICING))
+    pricing[period] = price
+    cfg['pricing'] = pricing
+    save_config(cfg)
 
-def root_add(name, ipv6=False):
-    """Добавляет нового пользователя через newclient.sh."""
+
+# --- Клиенты WireGuard ------------------------------------------------------
+
+def _client_conf_path(name):
+    return config.USERS_DIR / name / f'{name}.conf'
+
+
+def get_client_public_key(name, docker_container):
+    """Возвращает публичный ключ клиента.
+
+    Ключ выводится из приватного ключа в конфиге клиента; если конфига нет,
+    используется clientsTable, который ведёт newclient.sh.
+    """
+    conf_path = _client_conf_path(name)
+    if conf_path.exists():
+        try:
+            conf = conf_path.read_text(encoding='utf-8')
+            match = re.search(r'^PrivateKey\s*=\s*(\S+)', conf, re.MULTILINE)
+            if match:
+                result = subprocess.run(
+                    ['docker', 'exec', '-i', docker_container, 'wg', 'pubkey'],
+                    input=match.group(1), capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+                logger.error(f"wg pubkey для {name} завершился с ошибкой: {result.stderr.strip()}")
+        except Exception as e:
+            logger.error(f"Не удалось вычислить публичный ключ для {name}: {e}")
+
+    for entry in load_json(config.CLIENTS_TABLE_FILE, []):
+        if entry.get('userData', {}).get('clientName') == name:
+            return entry.get('clientId')
+    return None
+
+
+def root_add(name, endpoint, wg_config_file, docker_container):
+    """Создаёт нового клиента через newclient.sh."""
     try:
-        cmd = ['./newclient.sh', name]
-        if not ipv6:
-            cmd.append('--no-ipv6')
-        process = subprocess.run(cmd, capture_output=True, text=True)
+        process = subprocess.run(
+            [str(config.NEWCLIENT_SCRIPT), name, endpoint, wg_config_file, docker_container],
+            capture_output=True, text=True, cwd=str(config.BASE_DIR), timeout=120,
+        )
         if process.returncode == 0:
             return True
-        logger.error(f"Ошибка добавления пользователя {name}: {process.stderr}")
+        logger.error(f"Ошибка добавления клиента {name}: {process.stderr.strip() or process.stdout.strip()}")
         return False
     except Exception as e:
-        logger.error(f"Исключение при добавлении пользователя {name}: {str(e)}")
+        logger.error(f"Исключение при добавлении клиента {name}: {e}")
         return False
 
-def deactive_user_db(name):
-    """Деактивирует пользователя через removeclient.sh."""
+
+def deactive_user_db(name, wg_config_file, docker_container):
+    """Удаляет клиента через removeclient.sh."""
+    public_key = get_client_public_key(name, docker_container)
+    if not public_key:
+        logger.error(f"Не найден публичный ключ клиента {name} — удаление невозможно.")
+        return False
     try:
-        process = subprocess.run(['./removeclient.sh', name], capture_output=True, text=True)
+        process = subprocess.run(
+            [str(config.REMOVECLIENT_SCRIPT), name, public_key, wg_config_file, docker_container],
+            capture_output=True, text=True, cwd=str(config.BASE_DIR), timeout=120,
+        )
         if process.returncode == 0:
             return True
-        logger.error(f"Ошибка удаления пользователя {name}: {process.stderr}")
+        logger.error(f"Ошибка удаления клиента {name}: {process.stderr.strip() or process.stdout.strip()}")
         return False
     except Exception as e:
-        logger.error(f"Исключение при удалении пользователя {name}: {str(e)}")
+        logger.error(f"Исключение при удалении клиента {name}: {e}")
         return False
+
 
 def get_client_list():
-    """Возвращает список клиентов (имя и конфигурация)."""
+    """Возвращает список клиентов в виде пар (имя, конфигурация)."""
     clients = []
-    users_dir = 'users'
-    if os.path.exists(users_dir):
-        for user_dir in os.listdir(users_dir):
-            user_path = os.path.join(users_dir, user_dir)
-            if os.path.isdir(user_path):
-                conf_file = os.path.join(user_path, f"{user_dir}.conf")
-                if os.path.exists(conf_file):
-                    with open(conf_file, 'r') as f:
-                        config = f.read()
-                    clients.append((user_dir, config))
+    if not config.USERS_DIR.exists():
+        return clients
+    for user_dir in sorted(config.USERS_DIR.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        conf_file = user_dir / f'{user_dir.name}.conf'
+        if conf_file.exists():
+            clients.append((user_dir.name, conf_file.read_text(encoding='utf-8')))
     return clients
 
-def get_active_list():
-    """Возвращает список активных клиентов с последним handshake."""
-    active = []
-    users_dir = 'users'
-    if os.path.exists(users_dir):
-        for user_dir in os.listdir(users_dir):
-            user_path = os.path.join(users_dir, user_dir)
-            if os.path.isdir(user_path):
-                status_file = os.path.join(user_path, 'status.json')
-                if os.path.exists(status_file):
-                    with open(status_file, 'r') as f:
-                        status = json.load(f)
-                    last_handshake = status.get('last_handshake', 'never')
-                    active.append((user_dir, last_handshake))
+
+def get_active_list(wg_config_file, docker_container):
+    """Возвращает {имя клиента: время последнего handshake (UTC) или None}.
+
+    Данные берутся из `wg show latest-handshakes` внутри контейнера Amnezia.
+    """
+    interface = wg_config_file.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+    handshakes = {}
+    try:
+        result = subprocess.run(
+            ['docker', 'exec', '-i', docker_container, 'wg', 'show', interface, 'latest-handshakes'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(f"wg show завершился с ошибкой: {result.stderr.strip()}")
+            return {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            timestamp = int(parts[1])
+            handshakes[parts[0]] = (
+                datetime.fromtimestamp(timestamp, pytz.utc) if timestamp > 0 else None
+            )
+    except Exception as e:
+        logger.error(f"Не удалось получить статусы клиентов: {e}")
+        return {}
+
+    active = {}
+    for entry in load_json(config.CLIENTS_TABLE_FILE, []):
+        name = entry.get('userData', {}).get('clientName')
+        if name and entry.get('clientId') in handshakes:
+            active[name] = handshakes[entry['clientId']]
     return active
 
-def set_user_expiration(username, expiration, transfer_limit):
-    """Устанавливает срок действия и лимит трафика для пользователя."""
-    data = load_json(USER_EXPIRATION_FILE, {})
+
+# --- Подписки ---------------------------------------------------------------
+
+def set_user_expiration(username, expiration, transfer_limit='Неограниченно'):
+    """Устанавливает срок действия подписки пользователя."""
+    data = load_json(config.USER_EXPIRATION_FILE, {})
     data[username] = {
         'expiration': expiration.isoformat() if expiration else None,
-        'transfer_limit': transfer_limit
+        'transfer_limit': transfer_limit,
     }
-    save_json(USER_EXPIRATION_FILE, data)
+    save_json(config.USER_EXPIRATION_FILE, data)
+
 
 def get_user_expiration(username):
-    """Получает срок действия подписки пользователя."""
-    data = load_json(USER_EXPIRATION_FILE, {})
-    user_data = data.get(username, {})
-    expiration = user_data.get('expiration')
-    return datetime.fromisoformat(expiration) if expiration else None
+    """Возвращает срок действия подписки пользователя (aware datetime в UTC)."""
+    data = load_json(config.USER_EXPIRATION_FILE, {})
+    expiration = data.get(username, {}).get('expiration')
+    if not expiration:
+        return None
+    try:
+        parsed = datetime.fromisoformat(expiration)
+    except ValueError:
+        logger.error(f"Некорректная дата окончания подписки у {username}: {expiration}")
+        return None
+    return parsed if parsed.tzinfo else pytz.utc.localize(parsed)
+
+
+def get_all_expirations():
+    """Возвращает {имя клиента: дата окончания подписки} для всех клиентов."""
+    data = load_json(config.USER_EXPIRATION_FILE, {})
+    return {username: get_user_expiration(username) for username in data}
+
 
 def remove_user_expiration(username):
     """Удаляет информацию о сроке действия подписки пользователя."""
-    data = load_json(USER_EXPIRATION_FILE, {})
+    data = load_json(config.USER_EXPIRATION_FILE, {})
     if username in data:
         del data[username]
-        save_json(USER_EXPIRATION_FILE, data)
+        save_json(config.USER_EXPIRATION_FILE, data)
+
 
 def set_user_telegram_id(username, telegram_id):
-    """Связывает имя пользователя с Telegram ID."""
-    data = load_json(USER_TELEGRAM_FILE, {})
+    """Связывает имя клиента с Telegram ID."""
+    data = load_json(config.USER_TELEGRAM_FILE, {})
     data[username] = telegram_id
-    save_json(USER_TELEGRAM_FILE, data)
+    save_json(config.USER_TELEGRAM_FILE, data)
+
 
 def get_user_telegram_id(username):
-    """Получает Telegram ID пользователя по имени."""
-    data = load_json(USER_TELEGRAM_FILE, {})
-    return data.get(username)
+    """Возвращает Telegram ID владельца клиента."""
+    return load_json(config.USER_TELEGRAM_FILE, {}).get(username)
+
+
+def remove_user_telegram_id(username):
+    """Удаляет связь клиента с Telegram ID."""
+    data = load_json(config.USER_TELEGRAM_FILE, {})
+    if username in data:
+        del data[username]
+        save_json(config.USER_TELEGRAM_FILE, data)
+
+
+def get_usernames_by_telegram_id(telegram_id):
+    """Возвращает имена клиентов, принадлежащих пользователю Telegram."""
+    data = load_json(config.USER_TELEGRAM_FILE, {})
+    return [name for name, owner in data.items() if owner == telegram_id]
+
+
+# --- Промокоды --------------------------------------------------------------
 
 def add_promocode(code, discount, expires_at, max_uses, subscription_period):
     """Добавляет новый промокод."""
-    promocodes = load_json(PROMOCODES_FILE, {})
+    promocodes = load_json(config.PROMOCODES_FILE, {})
     if code in promocodes:
         return False
     promocodes[code] = {
@@ -167,48 +275,95 @@ def add_promocode(code, discount, expires_at, max_uses, subscription_period):
         'expires_at': expires_at.isoformat() if expires_at else None,
         'max_uses': max_uses,
         'uses': 0,
-        'subscription_period': subscription_period
+        'subscription_period': subscription_period,
     }
-    save_json(PROMOCODES_FILE, promocodes)
+    save_json(config.PROMOCODES_FILE, promocodes)
     return True
 
-def apply_promocode(code):
-    """Применяет промокод, увеличивает счетчик использований."""
-    promocodes = load_json(PROMOCODES_FILE, {})
-    now = datetime.now(pytz.utc)
-    promo = promocodes.get(code)
+
+def validate_promocode(code):
+    """Проверяет промокод, НЕ расходуя использование.
+
+    Возвращает {'discount': ..., 'subscription_period': ...} или None.
+    Счётчик использований увеличивает только consume_promocode().
+    """
+    promo = load_json(config.PROMOCODES_FILE, {}).get(code)
     if not promo:
         return None
-    if promo['expires_at'] and datetime.fromisoformat(promo['expires_at']) < now:
+    if promo['expires_at'] and datetime.fromisoformat(promo['expires_at']) < datetime.now(pytz.utc):
         return None
     if promo['max_uses'] is not None and promo['uses'] >= promo['max_uses']:
         return None
-    promo['uses'] += 1
-    save_json(PROMOCODES_FILE, promocodes)
     return {
         'discount': promo['discount'],
-        'subscription_period': promo['subscription_period']
+        'subscription_period': promo['subscription_period'],
     }
 
+
+def consume_promocode(code):
+    """Расходует одно использование промокода после успешной выдачи ключа."""
+    promocodes = load_json(config.PROMOCODES_FILE, {})
+    promo = promocodes.get(code)
+    if not promo:
+        return False
+    promo['uses'] += 1
+    save_json(config.PROMOCODES_FILE, promocodes)
+    return True
+
+
 def get_promocodes():
-    """Возвращает список всех промокодов."""
-    promocodes = load_json(PROMOCODES_FILE, {})
+    """Возвращает все промокоды с разобранными датами."""
     result = {}
-    for code, info in promocodes.items():
+    for code, info in load_json(config.PROMOCODES_FILE, {}).items():
         result[code] = {
             'discount': info['discount'],
             'expires_at': datetime.fromisoformat(info['expires_at']) if info['expires_at'] else None,
             'max_uses': info['max_uses'],
             'uses': info['uses'],
-            'subscription_period': info['subscription_period']
+            'subscription_period': info['subscription_period'],
         }
     return result
 
+
 def remove_promocode(code):
     """Удаляет промокод."""
-    promocodes = load_json(PROMOCODES_FILE, {})
+    promocodes = load_json(config.PROMOCODES_FILE, {})
     if code in promocodes:
         del promocodes[code]
-        save_json(PROMOCODES_FILE, promocodes)
+        save_json(config.PROMOCODES_FILE, promocodes)
         return True
     return False
+
+
+# --- Платежи ----------------------------------------------------------------
+
+def record_payment(charge_id, telegram_id, username, period, amount, currency, promocode=None):
+    """Сохраняет успешный платёж. Возвращает False, если платёж уже записан.
+
+    Telegram может доставить successful_payment повторно, поэтому запись
+    идемпотентна по идентификатору платежа провайдера.
+    """
+    payments = load_json(config.PAYMENTS_FILE, {})
+    if charge_id in payments:
+        return False
+    payments[charge_id] = {
+        'telegram_id': telegram_id,
+        'username': username,
+        'period': period,
+        'amount': amount,
+        'currency': currency,
+        'promocode': promocode,
+        'paid_at': datetime.now(pytz.utc).isoformat(),
+    }
+    save_json(config.PAYMENTS_FILE, payments)
+    return True
+
+
+def is_payment_recorded(charge_id):
+    """Проверяет, обработан ли уже платёж с таким идентификатором."""
+    return charge_id in load_json(config.PAYMENTS_FILE, {})
+
+
+def get_payments():
+    """Возвращает все записанные платежи."""
+    return load_json(config.PAYMENTS_FILE, {})

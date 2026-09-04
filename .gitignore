@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+myenv/
+venv/
+.version
+
+# Рабочие данные и секреты бота
+awg/files/*
+!awg/files/config.json.example
+awg/users/
+backup_*.zip

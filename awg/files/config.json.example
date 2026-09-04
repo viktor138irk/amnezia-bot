@@ -1,0 +1,26 @@
+{
+  "bot_token": "123456789:AA...ваш токен от @BotFather",
+
+  "admin_ids": ["123456789"],
+  "moderator_ids": [],
+
+  "wg_config_file": "/opt/amnezia/awg/wg0.conf",
+  "docker_container": "amnezia-awg",
+  "endpoint": "203.0.113.10",
+
+  "payment_provider_token": "381764678:TEST:0000000000",
+  "payment_currency": "RUB",
+
+  "pricing": {
+    "1_month": 1000.0,
+    "3_months": 2500.0,
+    "6_months": 4500.0,
+    "12_months": 8000.0
+  },
+
+  "payment_receipt": {
+    "enabled": false,
+    "vat_code": 1,
+    "tax_system_code": 1
+  }
+}
